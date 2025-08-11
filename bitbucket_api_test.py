@@ -28,7 +28,6 @@ PERSONAL_ACCESS_TOKEN = "your-personal-access-token"     # Your personal access 
 TEST_BRANCH_NAME = "feature/test-branch"
 TEST_BASE_BRANCH = "main"
 TEST_PR_ID = "1"
-TEST_COMMIT_MESSAGE = "Test commit message"
 
 # =============================================================================
 # API CLIENT CLASS
@@ -309,8 +308,8 @@ class BitbucketServerAPI:
             return pr_info
         return None
     
-    def get_pull_request_diff(self, project_key: str, repository: str, pr_id: str) -> Optional[str]:
-        """Get pull request diff - returns formatted diff summary"""
+    def get_pull_request_diff(self, project_key: str, repository: str, pr_id: str, show_code_changes: bool = False) -> Optional[Dict]:
+        """Get pull request diff - returns formatted diff summary for LLM analysis"""
         endpoint = f"/rest/api/latest/projects/{project_key}/repos/{repository}/pull-requests/{pr_id}/diff"
         response = self._make_request('GET', endpoint)
         
@@ -318,22 +317,305 @@ class BitbucketServerAPI:
             diff_text = response.text
             lines = diff_text.split('\n')
             
-            # Count file changes and modifications
-            files_changed = len([line for line in lines if line.startswith('diff --git')])
-            additions = len([line for line in lines if line.startswith('+')])
-            deletions = len([line for line in lines if line.startswith('-')])
+            # Parse diff to extract meaningful information
+            files_changed = []
+            current_file = None
+            additions = 0
+            deletions = 0
             
-            print(f"\n📊 Pull Request Diff Summary:")
-            print(f"   Files changed: {files_changed}")
-            print(f"   Lines added: {additions}")
-            print(f"   Lines deleted: {deletions}")
-            print(f"   Total diff size: {len(diff_text)} characters")
+            for line in lines:
+                if line.startswith('diff --git'):
+                    # Extract file path from: diff --git a/path/file.ext b/path/file.ext
+                    parts = line.split(' ')
+                    if len(parts) >= 4:
+                        file_path = parts[2][2:]  # Remove 'a/' prefix
+                        current_file = {
+                            'path': file_path,
+                            'additions': 0,
+                            'deletions': 0,
+                            'type': 'modified'
+                        }
+                        files_changed.append(current_file)
+                elif line.startswith('new file mode'):
+                    if current_file:
+                        current_file['type'] = 'added'
+                elif line.startswith('deleted file mode'):
+                    if current_file:
+                        current_file['type'] = 'deleted'
+                elif line.startswith('+') and not line.startswith('+++'):
+                    # Count actual additions (not metadata lines)
+                    additions += 1
+                    if current_file:
+                        current_file['additions'] += 1
+                elif line.startswith('-') and not line.startswith('---'):
+                    # Count actual deletions (not metadata lines)
+                    deletions += 1
+                    if current_file:
+                        current_file['deletions'] += 1
             
-            return diff_text
+            # Create summary for LLM consumption
+            summary = {
+                'total_files': len(files_changed),
+                'total_additions': additions,
+                'total_deletions': deletions,
+                'files': files_changed,
+                'diff_size': len(diff_text),
+                'large_pr': len(diff_text) > 100000  # Consider >100KB as large
+            }
+            
+            print(f"\n📊 Pull Request Diff Analysis:")
+            print(f"   📁 Files changed: {summary['total_files']}")
+            print(f"   ➕ Lines added: {summary['total_additions']}")
+            print(f"   ➖ Lines deleted: {summary['total_deletions']}")
+            print(f"   📏 Total diff size: {summary['diff_size']:,} characters")
+            
+            if summary['large_pr']:
+                print(f"   ⚠️  Large PR detected - providing summary only")
+            
+            print(f"\n📝 File Changes:")
+            for i, file in enumerate(files_changed[:10], 1):  # Show max 10 files
+                change_type = {'added': '🆕', 'deleted': '🗑️', 'modified': '✏️'}
+                print(f"   {i}. {change_type.get(file['type'], '✏️')} {file['path']}")
+                print(f"      +{file['additions']} -{file['deletions']} lines")
+            
+            if len(files_changed) > 10:
+                print(f"   ... and {len(files_changed) - 10} more files")
+            
+            # Optionally show actual code changes for small PRs
+            if show_code_changes and not summary['large_pr']:
+                print(f"\n📋 Code Changes Preview:")
+                print(f"   (Showing first 2000 characters of actual diff)")
+                print(f"   {'-'*50}")
+                print(f"{diff_text[:2000]}")
+                if len(diff_text) > 2000:
+                    print(f"   ... (truncated - total {len(diff_text):,} characters)")
+                print(f"   {'-'*50}")
+                
+            return summary
+        return None
+    
+    def get_pr_for_code_review(self, project_key: str, repository: str, pr_id: str) -> Optional[Dict]:
+        """Get PR diff optimized specifically for LLM code review - shows actual code changes"""
+        endpoint = f"/rest/api/latest/projects/{project_key}/repos/{repository}/pull-requests/{pr_id}/diff"
+        response = self._make_request('GET', endpoint)
+        
+        if response and response.status_code == 200:
+            diff_text = response.text
+            lines = diff_text.split('\n')
+            
+            # Parse diff to extract actual code changes for review
+            files_for_review = []
+            current_file = None
+            current_hunk = None
+            
+            for line in lines:
+                if line.startswith('diff --git'):
+                    # Save previous file
+                    if current_file and current_file['hunks']:
+                        files_for_review.append(current_file)
+                    
+                    # Start new file
+                    parts = line.split(' ')
+                    file_path = parts[2][2:] if len(parts) >= 4 else 'unknown'
+                    current_file = {
+                        'file_path': file_path,
+                        'file_type': 'modified',
+                        'hunks': [],
+                        'total_additions': 0,
+                        'total_deletions': 0
+                    }
+                    current_hunk = None
+                    
+                elif line.startswith('new file mode'):
+                    if current_file:
+                        current_file['file_type'] = 'added'
+                elif line.startswith('deleted file mode'):
+                    if current_file:
+                        current_file['file_type'] = 'deleted'
+                elif line.startswith('@@') and current_file:
+                    # New hunk - save previous one
+                    if current_hunk:
+                        current_file['hunks'].append(current_hunk)
+                    
+                    # Parse hunk header: @@ -42,7 +42,10 @@ method signature
+                    current_hunk = {
+                        'header': line,
+                        'changes': [],
+                        'additions': 0,
+                        'deletions': 0
+                    }
+                elif current_hunk and (line.startswith('+') or line.startswith('-') or line.startswith(' ')):
+                    # Actual code changes
+                    if line.startswith('+') and not line.startswith('+++'):
+                        current_hunk['changes'].append(('added', line[1:]))
+                        current_hunk['additions'] += 1
+                        current_file['total_additions'] += 1
+                    elif line.startswith('-') and not line.startswith('---'):
+                        current_hunk['changes'].append(('removed', line[1:]))
+                        current_hunk['deletions'] += 1
+                        current_file['total_deletions'] += 1
+                    elif line.startswith(' '):
+                        current_hunk['changes'].append(('context', line[1:]))
+            
+            # Save final hunk and file
+            if current_hunk:
+                current_file['hunks'].append(current_hunk)
+            if current_file and current_file['hunks']:
+                files_for_review.append(current_file)
+            
+            # Calculate total changes
+            total_files = len(files_for_review)
+            total_additions = sum(f['total_additions'] for f in files_for_review)
+            total_deletions = sum(f['total_deletions'] for f in files_for_review)
+            
+            # Determine review strategy based on size
+            is_large_pr = len(diff_text) > 50000  # 50KB threshold for detailed review
+            
+            print(f"\n📋 Code Review Analysis:")
+            print(f"   📁 Files to review: {total_files}")
+            print(f"   ➕ Lines added: {total_additions}")
+            print(f"   ➖ Lines deleted: {total_deletions}")
+            print(f"   📏 Diff size: {len(diff_text):,} characters")
+            
+            if is_large_pr:
+                print(f"   ⚠️  Large PR - showing key changes only")
+                # For large PRs, show only files with significant changes
+                files_for_review = [f for f in files_for_review if f['total_additions'] + f['total_deletions'] > 10]
+                files_for_review = files_for_review[:5]  # Max 5 files for large PRs
+            else:
+                print(f"   ✅ Normal size PR - showing detailed changes")
+                files_for_review = files_for_review[:8]  # Max 8 files for normal PRs
+            
+            print(f"\n🔍 Code Changes for Review:")
+            
+            for i, file_info in enumerate(files_for_review, 1):
+                file_type_icon = {'added': '🆕', 'deleted': '🗑️', 'modified': '✏️'}
+                print(f"\n   {i}. {file_type_icon.get(file_info['file_type'], '✏️')} {file_info['file_path']}")
+                print(f"      Changes: +{file_info['total_additions']} -{file_info['total_deletions']} lines")
+                
+                # Show actual code changes for each file
+                for j, hunk in enumerate(file_info['hunks'][:3], 1):  # Max 3 hunks per file
+                    print(f"\n      📍 Hunk {j}: {hunk['header']}")
+                    
+                    # Show the actual code changes (limited for context)
+                    lines_shown = 0
+                    context_lines = 0
+                    
+                    for change_type, code_line in hunk['changes']:
+                        if lines_shown >= 25:  # Max 25 lines per hunk
+                            remaining = len(hunk['changes']) - lines_shown
+                            print(f"         ... ({remaining} more lines in this hunk)")
+                            break
+                        
+                        if change_type == 'added':
+                            print(f"      ➕  {code_line}")
+                            lines_shown += 1
+                        elif change_type == 'removed':
+                            print(f"      ➖  {code_line}")
+                            lines_shown += 1
+                        elif change_type == 'context' and context_lines < 3:  # Limit context
+                            print(f"          {code_line}")
+                            context_lines += 1
+                            lines_shown += 1
+                
+                if len(file_info['hunks']) > 3:
+                    print(f"      ... and {len(file_info['hunks']) - 3} more hunks")
+            
+            if len([f for f in files_for_review if f['total_additions'] + f['total_deletions'] > 0]) < total_files:
+                remaining = total_files - len(files_for_review)
+                print(f"\n   ... and {remaining} more files (smaller changes)")
+            
+            return {
+                'files': files_for_review,
+                'total_files': total_files,
+                'total_additions': total_additions,
+                'total_deletions': total_deletions,
+                'diff_size': len(diff_text),
+                'review_strategy': 'detailed' if not is_large_pr else 'focused',
+                'ready_for_llm_review': True
+            }
+        return None
+    
+    def get_detailed_file_changes(self, project_key: str, repository: str, pr_id: str, max_files: int = 3) -> Optional[Dict]:
+        """Get detailed code changes for specific files - shows actual code modifications"""
+        endpoint = f"/rest/api/latest/projects/{project_key}/repos/{repository}/pull-requests/{pr_id}/diff"
+        response = self._make_request('GET', endpoint)
+        
+        if response and response.status_code == 200:
+            diff_text = response.text
+            lines = diff_text.split('\n')
+            
+            # Parse diff into file sections with actual code changes
+            file_sections = []
+            current_section = None
+            
+            for line in lines:
+                if line.startswith('diff --git'):
+                    # Start new file section
+                    if current_section:
+                        file_sections.append(current_section)
+                    
+                    parts = line.split(' ')
+                    file_path = parts[2][2:] if len(parts) >= 4 else 'unknown'
+                    current_section = {
+                        'file_path': file_path,
+                        'changes': [],
+                        'context': []
+                    }
+                elif current_section:
+                    if line.startswith('@@'):
+                        # Hunk header - shows line numbers
+                        current_section['context'].append(line)
+                    elif line.startswith('+') and not line.startswith('+++'):
+                        current_section['changes'].append(('added', line[1:]))
+                    elif line.startswith('-') and not line.startswith('---'):
+                        current_section['changes'].append(('removed', line[1:]))
+                    elif line.startswith(' '):
+                        # Context line
+                        current_section['changes'].append(('context', line[1:]))
+            
+            # Add final section
+            if current_section:
+                file_sections.append(current_section)
+            
+            print(f"\n🔍 Detailed Code Changes (showing up to {max_files} files):")
+            
+            for i, section in enumerate(file_sections[:max_files], 1):
+                print(f"\n   📄 {i}. {section['file_path']}")
+                
+                # Show hunk context
+                for context in section['context'][:2]:  # Max 2 hunks
+                    print(f"      📍 {context}")
+                
+                # Show actual changes (limited)
+                changes_shown = 0
+                for change_type, content in section['changes']:
+                    if changes_shown >= 20:  # Max 20 lines per file
+                        remaining = len(section['changes']) - changes_shown
+                        print(f"      ... ({remaining} more lines)")
+                        break
+                        
+                    if change_type == 'added':
+                        print(f"      ➕ {content}")
+                    elif change_type == 'removed':
+                        print(f"      ➖ {content}")
+                    elif change_type == 'context' and changes_shown < 15:  # Show less context
+                        print(f"         {content}")
+                    
+                    changes_shown += 1
+            
+            if len(file_sections) > max_files:
+                print(f"\n   ... and {len(file_sections) - max_files} more files with changes")
+            
+            return {
+                'file_sections': file_sections,
+                'total_files': len(file_sections),
+                'detailed_view': True
+            }
         return None
     
     def get_pull_request_comments(self, project_key: str, repository: str, pr_id: str) -> Optional[List[Dict]]:
-        """Get pull request comments - returns formatted comment list"""
+        """Get pull request comments - returns detailed formatted comment list with file locations"""
         endpoint = f"/rest/api/latest/projects/{project_key}/repos/{repository}/pull-requests/{pr_id}/activities"
         params = {'fromType': 'COMMENT'}
         response = self._make_request('GET', endpoint, params=params)
@@ -341,28 +623,121 @@ class BitbucketServerAPI:
         if response and response.status_code == 200:
             data = response.json()
             comments = []
+            general_comments = 0
+            inline_comments = 0
+            
             for activity in data.get('values', []):
                 if activity.get('action') == 'COMMENTED':
                     comment_data = activity.get('comment', {})
+                    anchor = comment_data.get('anchor')
+                    
+                    # Determine comment type and extract location info
+                    is_inline = bool(anchor)
+                    if is_inline:
+                        inline_comments += 1
+                    else:
+                        general_comments += 1
+                    
                     comment_info = {
                         'id': comment_data.get('id'),
-                        'text': comment_data.get('text', '')[:200] + '...' if len(comment_data.get('text', '')) > 200 else comment_data.get('text', ''),
+                        'text': comment_data.get('text', ''),
                         'author': comment_data.get('author', {}).get('displayName'),
                         'created_date': comment_data.get('createdDate', 0) // 1000 if comment_data.get('createdDate') else 0,
-                        'file_path': comment_data.get('anchor', {}).get('path') if comment_data.get('anchor') else None,
-                        'line': comment_data.get('anchor', {}).get('line') if comment_data.get('anchor') else None
+                        'type': 'inline' if is_inline else 'general',
+                        'file_path': anchor.get('path') if anchor else None,
+                        'line_number': anchor.get('line') if anchor else None,
+                        'line_type': anchor.get('lineType') if anchor else None,  # ADDED, REMOVED, CONTEXT
+                        'from_hash': anchor.get('fromHash', '')[:8] if anchor else None,
+                        'to_hash': anchor.get('toHash', '')[:8] if anchor else None
                     }
+                    
+                    # Truncate long comments for display
+                    display_text = comment_info['text']
+                    if len(display_text) > 150:
+                        display_text = display_text[:150] + '...'
+                    comment_info['display_text'] = display_text
+                    
                     comments.append(comment_info)
             
-            print(f"\n💬 Found {len(comments)} comments:")
+            # Sort comments: inline comments first, then general comments
+            comments.sort(key=lambda x: (x['type'] == 'general', x['file_path'] or '', x['line_number'] or 0))
+            
+            print(f"\n💬 Found {len(comments)} comments ({inline_comments} inline, {general_comments} general):")
+            
+            # Group and display inline comments by file
+            current_file = None
             for i, comment in enumerate(comments, 1):
-                comment_type = "inline" if comment['file_path'] else "general"
-                print(f"   {i}. [{comment_type.upper()}] {comment['author']}")
-                print(f"      Text: {comment['text']}")
-                if comment['file_path']:
-                    print(f"      File: {comment['file_path']}:{comment['line']}")
-            return comments
+                if comment['type'] == 'inline':
+                    if comment['file_path'] != current_file:
+                        current_file = comment['file_path']
+                        print(f"\n   📄 {current_file}:")
+                    
+                    line_indicator = {
+                        'ADDED': '➕',
+                        'REMOVED': '➖', 
+                        'CONTEXT': '📍'
+                    }.get(comment['line_type'], '📍')
+                    
+                    print(f"      {line_indicator} Line {comment['line_number']} - {comment['author']}")
+                    print(f"         💭 {comment['display_text']}")
+                    
+                else:  # General comments
+                    if current_file is not None:  # Add separator after inline comments
+                        print(f"\n   💬 General Comments:")
+                        current_file = None
+                    print(f"      {i}. {comment['author']}")
+                    print(f"         💭 {comment['display_text']}")
+            
+            # Return structured data for LLM analysis
+            return {
+                'total_comments': len(comments),
+                'inline_comments': inline_comments,
+                'general_comments': general_comments,
+                'comments': comments,
+                'files_with_comments': list(set([c['file_path'] for c in comments if c['file_path']]))
+            }
         return None
+    
+    def get_pr_summary_for_llm(self, project_key: str, repository: str, pr_id: str) -> Optional[Dict]:
+        """Get comprehensive PR summary optimized for LLM analysis"""
+        print(f"\n🔍 Generating comprehensive PR summary for LLM analysis...")
+        
+        # Get PR details, code changes, and comments for comprehensive review
+        pr_details = self.get_pull_request(project_key, repository, pr_id)
+        pr_code_changes = self.get_pr_for_code_review(project_key, repository, pr_id)  
+        pr_comments = self.get_pull_request_comments(project_key, repository, pr_id)
+        
+        if not pr_details:
+            return None
+            
+        summary = {
+            'pr_info': pr_details,
+            'code_changes': pr_code_changes,
+            'comments': pr_comments,
+            'analysis_ready': True
+        }
+        
+        # Add recommendations for LLM
+        if pr_code_changes and pr_code_changes.get('review_strategy') == 'focused':
+            summary['llm_guidance'] = {
+                'focus_areas': ['major_modifications', 'key_files'],
+                'review_strategy': 'focused',
+                'attention_files': [f['file_path'] for f in pr_code_changes['files'][:5] if f['total_additions'] + f['total_deletions'] > 20]
+            }
+        else:
+            summary['llm_guidance'] = {
+                'focus_areas': ['line_level_changes', 'detailed_review', 'code_quality'],
+                'review_strategy': 'comprehensive',
+                'attention_files': [f['file_path'] for f in pr_code_changes['files'] if f['total_additions'] + f['total_deletions'] > 5] if pr_code_changes else []
+            }
+        
+        print(f"\n📋 LLM Analysis Summary Generated:")
+        print(f"   🎯 Review Strategy: {summary['llm_guidance']['review_strategy']}")
+        print(f"   🔍 Focus Areas: {', '.join(summary['llm_guidance']['focus_areas'])}")
+        if summary['llm_guidance']['attention_files']:
+            print(f"   📂 Key Files: {', '.join(summary['llm_guidance']['attention_files'][:3])}{'...' if len(summary['llm_guidance']['attention_files']) > 3 else ''}")
+        
+        return summary
     
     def add_pull_request_comment(self, project_key: str, repository: str, pr_id: str, comment_text: str) -> Optional[Dict]:
         """Add a general comment to a pull request"""
@@ -496,9 +871,17 @@ def test_pull_request_operations(api: BitbucketServerAPI):
     print("\n--- Testing get_pull_request ---")
     pr_details = api.get_pull_request(PROJECT_KEY, REPOSITORY_NAME, TEST_PR_ID)
     
-    # Get pull request diff
-    print("\n--- Testing get_pull_request_diff ---")
+    # Get pull request diff (summary only)
+    print("\n--- Testing get_pull_request_diff (summary) ---")
     pr_diff = api.get_pull_request_diff(PROJECT_KEY, REPOSITORY_NAME, TEST_PR_ID)
+    
+    # Get detailed code changes (actual code)
+    print("\n--- Testing get_detailed_file_changes (actual code) ---")
+    detailed_changes = api.get_detailed_file_changes(PROJECT_KEY, REPOSITORY_NAME, TEST_PR_ID)
+    
+    # Get PR optimized for LLM code review (RECOMMENDED FOR AI)
+    print("\n--- Testing get_pr_for_code_review (LLM-optimized) ---")
+    code_review_data = api.get_pr_for_code_review(PROJECT_KEY, REPOSITORY_NAME, TEST_PR_ID)
     
     # Get pull request comments
     print("\n--- Testing get_pull_request_comments ---")
@@ -512,6 +895,10 @@ def test_pull_request_operations(api: BitbucketServerAPI):
     # Add comment (commented out to avoid adding test comments)
     # print("\n--- Testing add_pull_request_comment ---")
     # api.add_pull_request_comment(PROJECT_KEY, REPOSITORY_NAME, TEST_PR_ID, "Test comment")
+    
+    # Get comprehensive LLM-ready PR summary
+    print("\n--- Testing get_pr_summary_for_llm ---")
+    pr_summary = api.get_pr_summary_for_llm(PROJECT_KEY, REPOSITORY_NAME, TEST_PR_ID)
 
 def test_commit_operations(api: BitbucketServerAPI):
     """Test commit-related operations"""
